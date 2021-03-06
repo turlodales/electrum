@@ -553,11 +553,16 @@ class Daemon(Logger):
             self.logger.info("shutting down network")
             self.network.stop()
         self.logger.info("stopping taskgroup")
-        fut = asyncio.run_coroutine_threadsafe(self.taskgroup.cancel_remaining(), self.asyncio_loop)
-        try:
-            fut.result(timeout=2)
-        except (concurrent.futures.TimeoutError, concurrent.futures.CancelledError, asyncio.CancelledError):
-            pass
+        if False:
+            fut = asyncio.run_coroutine_threadsafe(self.taskgroup.cancel_remaining(), self.asyncio_loop)
+            try:
+                fut.result(timeout=2)
+            except concurrent.futures.TimeoutError:
+                self.logger.info("cancel_remaining timed out")
+                pass
+            except (concurrent.futures.CancelledError, asyncio.CancelledError):
+                self.logger.info("cancel_remaining cancelled")
+                pass
         self.logger.info("removing lockfile")
         remove_lockfile(get_lockfile(self.config))
         self.logger.info("stopped")

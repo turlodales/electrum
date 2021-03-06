@@ -1238,6 +1238,7 @@ class Network(Logger, NetworkRetryManager[ServerAddr]):
         try:
             fut.result(timeout=2)
         except (concurrent.futures.TimeoutError, concurrent.futures.CancelledError): pass
+        self.logger.info('network stopped')
 
     async def _ensure_there_is_a_main_interface(self):
         if self.is_connected():

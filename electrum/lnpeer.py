@@ -312,8 +312,9 @@ class Peer(Logger):
         async with self.taskgroup as group:
             await group.spawn(self._message_loop())
             await group.spawn(self.htlc_switch())
-            await group.spawn(self.query_gossip())
-            await group.spawn(self.process_gossip())
+            #await group.spawn(self.query_gossip())
+            #await group.spawn(self.process_gossip())
+        self.logger.info('taskgroup exited')
 
     async def process_gossip(self):
         while True:
@@ -478,14 +479,22 @@ class Peer(Logger):
             await asyncio.wait_for(self.initialize(), LN_P2P_NETWORK_TIMEOUT)
         except (OSError, asyncio.TimeoutError, HandshakeFailed) as e:
             raise GracefulDisconnect(f'initialize failed: {repr(e)}') from e
-        async for msg in self.transport.read_messages():
-            self.process_message(msg)
-            await asyncio.sleep(.01)
+
+        while True:
+            try:
+                async for msg in self.transport.read_messages():
+                    self.process_message(msg)
+                await asyncio.sleep(.01)
+                self.logger.info('zzz')
+            except:
+                self.logger.exception('')
+                #raise
 
     def on_reply_short_channel_ids_end(self, payload):
         self.querying.set()
 
     def close_and_cleanup(self):
+        self.logger.info('close and cleanup')
         try:
             if self.transport:
                 self.transport.close()
@@ -1467,22 +1476,25 @@ class Peer(Logger):
                 # FIXME: adapt the error code
                 error_reason = OnionRoutingFailure(code=OnionFailureCode.UNKNOWN_NEXT_PEER, data=b'')
                 self.lnworker.trampoline_forwarding_failures[payment_hash] = error_reason
+            self.logger.info('forwarding completed')
 
-        asyncio.ensure_future(forward_trampoline_payment())
+        asyncio.ensure_future(self.taskgroup.spawn(forward_trampoline_payment()))
 
     def maybe_fulfill_htlc(
             self, *,
             chan: Channel,
             htlc: UpdateAddHtlc,
             processed_onion: ProcessedOnionPacket,
+            terminating: bool = False,
             is_trampoline: bool = False) -> Tuple[Optional[bytes], Optional[OnionPacket]]:
 
         """As a final recipient of an HTLC, decide if we should fulfill it.
         Return (preimage, trampoline_onion_packet) with at most a single element not None
         """
         def log_fail_reason(reason: str):
-            self.logger.info(f"maybe_fulfill_htlc. will FAIL HTLC: chan {chan.short_channel_id}. "
-                             f"{reason}. htlc={str(htlc)}. onion_payload={processed_onion.hop_data.payload}")
+            self.logger.info(
+                f"maybe_fulfill_htlc. will FAIL HTLC: chan {chan.short_channel_id}. "
+                f"{reason}. htlc={str(htlc)}. onion_payload={processed_onion.hop_data.payload}")
 
         try:
             amt_to_forward = processed_onion.hop_data.payload["amt_to_forward"]["amt_to_forward"]
@@ -1539,6 +1551,8 @@ class Peer(Logger):
 
         if total_msat > amt_to_forward:
             mpp_status = self.lnworker.add_received_htlc(payment_secret_from_onion, chan.short_channel_id, htlc, total_msat)
+            if mpp_status is None and terminating is True:
+                mpp_status = False
             if mpp_status is None:
                 return None, None
             if mpp_status is False:
@@ -1794,10 +1808,26 @@ class Peer(Logger):
         return closing_tx.txid()
 
     async def htlc_switch(self):
-        await self.initialized
-        while True:
-            await asyncio.sleep(0.1)
-            self.ping_if_required()
+        try:
+            await self.initialized
+            while True:
+                await asyncio.sleep(0.1)
+                self.ping_if_required()
+                self._htlc_switch(False)
+        except asyncio.CancelledError as e:
+            print('klkl uuuu')
+            self._htlc_switch(True)
+            while True:
+                print('loop uuuu')
+                try:
+                    await asyncio.sleep(1)
+                    #break
+                except:#
+                    self.logger.exception('')
+                    pass
+            #raise
+
+    def _htlc_switch(self, terminating):
             for chan_id, chan in self.channels.items():
                 if not chan.can_send_ctx_updates():
                     continue
@@ -1823,6 +1853,7 @@ class Peer(Logger):
                             preimage, fw_info, error_bytes = self.process_unfulfilled_htlc(
                                 chan=chan,
                                 htlc=htlc,
+                                terminating=terminating,
                                 forwarding_info=forwarding_info,
                                 onion_packet_bytes=onion_packet_bytes,
                                 onion_packet=onion_packet)
@@ -1832,7 +1863,7 @@ class Peer(Logger):
                         unfulfilled[htlc_id] = local_ctn, remote_ctn, onion_packet_hex, fw_info
                     elif preimage or error_reason or error_bytes:
                         if preimage:
-                            await self.lnworker.enable_htlc_settle.wait()
+                            #await self.lnworker.enable_htlc_settle.wait()
                             self.fulfill_htlc(chan, htlc.htlc_id, preimage)
                         elif error_bytes:
                             self.fail_htlc(
@@ -1848,6 +1879,8 @@ class Peer(Logger):
                 # cleanup
                 for htlc_id in done:
                     unfulfilled.pop(htlc_id)
+                # 
+                self.maybe_send_commitment(chan)
 
     def process_unfulfilled_htlc(
             self, *,
@@ -1855,6 +1888,7 @@ class Peer(Logger):
             htlc: UpdateAddHtlc,
             forwarding_info: Tuple[str, int],
             onion_packet_bytes: bytes,
+            terminating = False,
             onion_packet: OnionPacket) -> Tuple[Optional[bytes], Union[bool, None, Tuple[str, int]], Optional[bytes]]:
         """
         return (preimage, fw_info, error_bytes) with at most a single element that is not None
@@ -1869,6 +1903,7 @@ class Peer(Logger):
             preimage, trampoline_onion_packet = self.maybe_fulfill_htlc(
                 chan=chan,
                 htlc=htlc,
+                terminating=terminating,
                 processed_onion=processed_onion)
             # trampoline forwarding
             if trampoline_onion_packet:
@@ -1882,6 +1917,7 @@ class Peer(Logger):
                         preimage, _ = self.maybe_fulfill_htlc(
                             chan=chan,
                             htlc=htlc,
+                            terminating=terminating,
                             processed_onion=trampoline_onion,
                             is_trampoline=True)
                     else:

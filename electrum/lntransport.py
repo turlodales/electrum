@@ -124,7 +124,8 @@ class LNTransportBase:
                 try:
                     s = await self.reader.read(2**10)
                 except asyncio.CancelledError:
-                    raise
+                    continue
+                    #raise
                 except Exception:
                     s = None
                 if not s:

@@ -107,8 +107,15 @@ class ChannelsList(MyTreeView):
         msg = _('Close channel?')
         if not self.parent.question(msg):
             return
+        coro = self.lnworker.close_channel(channel_id)
+        if random.randint(0, 10) == 0:
+            msg = _(
+                'Request force close?\n\n'
+                'Your node will pretend that it has lost its data and ask the remote node to broadcast their latest state. '
+                'Doing so from time to time helps make sure that nodes are honest, because your node can punish them if they broadcast a revoked state.')
+            if self.parent.question(msg):
+                coro = self.lnworker.request_remote_force_close(channel_id)
         def task():
-            coro = self.lnworker.close_channel(channel_id)
             return self.network.run_from_another_thread(coro)
         WaitingDialog(self, 'please wait..', task, self.on_success, self.on_failure)
 
@@ -219,7 +226,8 @@ class ChannelsList(MyTreeView):
                 if closing_tx:
                     menu.addAction(_("View closing transaction"), lambda: self.parent.show_transaction(closing_tx))
         menu.addSeparator()
-        menu.addAction(_("Export backup"), lambda: self.export_channel_backup(channel_id))
+        if not self.lnworker.has_recoverable_channels():
+            menu.addAction(_("Export backup"), lambda: self.export_channel_backup(channel_id))
         if chan.is_redeemed():
             menu.addSeparator()
             menu.addAction(_("Delete"), lambda: self.remove_channel(channel_id))

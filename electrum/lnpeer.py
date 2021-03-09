@@ -773,6 +773,9 @@ class Peer(Logger):
 
         Channel configurations are initialized in this method.
         """
+        if self.lnworker.has_recoverable_channels():
+            # FIXME: we might want to keep the connection open
+            raise Exception('not accepting channels')
         # <- open_channel
         if payload['chain_hash'] != constants.net.rev_genesis_bytes():
             raise Exception('wrong chain_hash')

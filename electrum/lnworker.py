@@ -32,10 +32,12 @@ from .util import NetworkRetryManager, JsonRPCClient
 from .lnutil import LN_MAX_FUNDING_SAT
 from .keystore import BIP32_KeyStore
 from .bitcoin import COIN
+from .bitcoin import opcodes, push_script
 from .transaction import Transaction
 from .crypto import sha256
 from .bip32 import BIP32Node
 from .util import bh2u, bfh, InvoiceError, resolve_dns_srv, is_ip_address, log_exceptions
+from .crypto import chacha20_encrypt, chacha20_decrypt
 from .util import ignore_exceptions, make_aiohttp_session, SilentTaskGroup
 from .util import timestamp_to_datetime, random_shuffled_copy
 from .util import MyEncoder, is_private_netaddress
@@ -91,6 +93,10 @@ SAVED_PR_STATUS = [PR_PAID, PR_UNPAID] # status that are persisted
 
 
 NUM_PEERS_TARGET = 4
+
+# channel backup data
+CB_MAGIC = 0
+CB_VERSION = 0
 
 
 FALLBACK_NODE_LIST_TESTNET = (
@@ -189,6 +195,7 @@ class LNWorker(Logger, NetworkRetryManager[LNPeerAddr]):
         )
         self.lock = threading.RLock()
         self.node_keypair = generate_keypair(BIP32Node.from_xkey(xprv), LnKeyFamily.NODE_KEY)
+        self.backup_key = generate_keypair(BIP32Node.from_xkey(xprv), LnKeyFamily.BACKUP_CIPHER).privkey
         self._peers = {}  # type: Dict[bytes, Peer]  # pubkey -> Peer  # needs self.lock
         self.taskgroup = SilentTaskGroup()
         self.listen_server = None  # type: Optional[asyncio.AbstractServer]
@@ -623,6 +630,15 @@ class LNWallet(LNWorker):
 
         self.trampoline_forwarding_failures = {} # todo: should be persisted
 
+    def has_deterministic_node_id(self):
+        return bool(self.db.get('lightning_xprv'))
+
+    def has_recoverable_channels(self):
+        # TODO: expose use_recoverable_channels in preferences
+        return self.has_deterministic_node_id() \
+            and self.config.get('use_recoverable_channels', True) \
+            and not (self.config.get('lightning_listen'))
+
     @property
     def channels(self) -> Mapping[bytes, Channel]:
         """Returns a read-only copy of channels."""
@@ -988,14 +1004,28 @@ class LNWallet(LNWorker):
             self, *,
             coins: Sequence[PartialTxInput],
             funding_sat: int,
+            node_id: bytes,
             fee_est=None) -> PartialTransaction:
         dummy_address = ln_dummy_address()
         outputs = [PartialTxOutput.from_address_and_value(dummy_address, funding_sat)]
+        if self.has_recoverable_channels():
+            make_op_return = lambda x: bytes([opcodes.OP_RETURN]) + bytes.fromhex(push_script(x.hex()))
+            # Note: with anchor_outputs we will need to add local_delay to the backup data
+            backup_data = bytes([CB_MAGIC, CB_VERSION]) + node_id
+            dummy_scriptpubkey = make_op_return(backup_data)
+            outputs.append(PartialTxOutput(scriptpubkey=dummy_scriptpubkey, value=0))
         tx = self.wallet.make_unsigned_transaction(
             coins=coins,
             outputs=outputs,
             fee=fee_est)
         tx.set_rbf(False)
+        if self.has_recoverable_channels():
+            nonce = tx.inputs()[0].prevout.txid[0:12]
+            encrypted_data = chacha20_encrypt(key=self.backup_key, data=backup_data, nonce=nonce)
+            assert len(encrypted_data) == len(backup_data)
+            for o in tx.outputs():
+                if o.scriptpubkey == dummy_scriptpubkey:
+                    o.scriptpubkey = make_op_return(encrypted_data)
         return tx
 
     def open_channel(self, *, connect_str: str, funding_tx: PartialTransaction,
@@ -2040,6 +2070,17 @@ class LNWallet(LNWorker):
             raise Exception(f'channel backup not found {self.channel_backups}')
         cb = cb.cb # storage
         self.logger.info(f'requesting channel force close: {channel_id.hex()}')
+        if cb.privkey == self.wallet.lnworker.node_keypair.privkey:
+            if not self.channel_db:
+                raise Exception('Enable gossip first')
+            addresses = self.network.channel_db.get_node_addresses(cb.node_id)
+            for host, port, timestamp in addresses:
+                peer = await self._add_peer(host, port, cb.node_id)
+                break
+            else:
+                raise Exception('Peer not found in gossip database')
+            return await peer.trigger_force_close(channel_id)
+        # legacy backup
         # TODO also try network addresses from gossip db (as it might have changed)
         peer_addr = LNPeerAddr(cb.host, cb.port, cb.node_id)
         transport = LNTransport(cb.privkey, peer_addr, proxy=self.network.proxy)
@@ -2048,3 +2089,49 @@ class LNWallet(LNWorker):
             await group.spawn(peer._message_loop())
             await group.spawn(peer.trigger_force_close(channel_id))
         return True
+
+    def maybe_add_backup_from_tx(self, tx):
+        from .transaction import get_script_type_from_output_script
+        node_id = None
+        funding_address = None
+        for i, o in enumerate(tx.outputs()):
+            script_type = get_script_type_from_output_script(o.scriptpubkey)
+            if node_id is None and o.scriptpubkey.startswith(bytes([opcodes.OP_RETURN])):
+                encrypted_data = o.scriptpubkey[2:]
+                nonce = tx.inputs()[0].prevout.txid[0:12]
+                data = chacha20_decrypt(key=self.backup_key, data=encrypted_data, nonce=nonce)
+                if data[0] == CB_MAGIC and data[1] == CB_VERSION:
+                    node_id = data[2:]
+            elif script_type == 'p2wsh':
+                funding_index = i
+                funding_address = o.address
+        if not node_id or not funding_address:
+            return
+        funding_txid = tx.txid()
+
+        cb_storage = ChannelBackupStorage(
+            node_id = node_id,
+            privkey = self.wallet.lnworker.node_keypair.privkey,
+            funding_txid = funding_txid,
+            funding_index = funding_index,
+            funding_address = funding_address,
+            host = 'unknown',
+            port = 0,
+            is_initiator = True,
+            channel_seed = b'',
+            local_delay = 144,
+            remote_delay = 144,
+            remote_revocation_pubkey = b'',
+            remote_payment_pubkey = b'')
+
+        channel_id = cb_storage.channel_id().hex()
+        if channel_id in self.db.get_dict("channels"):
+            return
+
+        self.logger.info(f"adding backup from tx")
+        d = self.db.get_dict("channel_backups")
+        d[channel_id] = cb_storage
+        self._channel_backups[bfh(channel_id)] = cb = ChannelBackup(cb_storage, sweep_address=self.sweep_address, lnworker=self)
+        self.wallet.save_db()
+        util.trigger_callback('channels_updated', self.wallet)
+        self.lnwatcher.add_channel(cb.funding_outpoint.to_str(), cb.get_funding_address())
